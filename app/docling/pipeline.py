@@ -111,11 +111,7 @@ async def delete_file_vector_pipeline(fileid: str):
     """
     try:
         _qdrantService = await DoclingQdrantService.from_config()
-        result = _qdrantService.delete_by_file_id(fileid)  # Note: delete_by_file_id is synchronous in qdrant_service based on my read, but usually services are async. Checking file... it uses self.client.delete which is sync in non-async qdrant client.
-        # Wait, DoclingQdrantService methods seem synchronous (def delete_by_file_id). 
-        # But here we are in async function. 
-        # If delete_by_file_id is blocking, it might block the loop. 
-        # But for now I will keep it as called.
+        result = await _qdrantService.delete_by_file_id(fileid)
         
         if result > 0:
             print(f"Permanent delete the vector of {fileid}")

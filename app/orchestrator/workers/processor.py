@@ -5,6 +5,7 @@ Processes crawled pages: text extraction, OCR decision, and chunking.
 CPU-intensive worker.
 """
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Optional
@@ -332,7 +333,8 @@ class ProcessorWorker(BaseWorker):
             # Extract original filename from URL
             original_filename = page.url.split("/")[-1] or "document.pdf"
             
-            store.create_document(
+            await asyncio.to_thread(
+                store.create_document,
                 original_file=original_filename,
                 source_url=page.url,
                 file_path=str(dest_path),

@@ -804,6 +804,7 @@ from docling_core.transforms.chunker.base import BaseChunk
 # from app.docling knowledgebase.schemas import VectorMetaData
 from app.docling.qdrant_adapter import DoclingChunkMetadata
 from app.config import app_config
+from app.core.circuit_breaker import CircuitBreaker
 import logging
 logger = logging.getLogger("docling_qdrant_services")
 
@@ -828,6 +829,13 @@ class DoclingQdrantService:
             self.client = QdrantClient(url=url, api_key=apikey)
             self.collection_name = collection_name
             self.model_name = embedding_model
+            
+            # Circuit breaker for Qdrant operations
+            self._breaker = CircuitBreaker(
+                failure_threshold=3,
+                recovery_timeout=60,
+                success_threshold=2
+            )
             
             # Initialize local embedding model
             from app.config import get_embedding_model
@@ -1254,13 +1262,14 @@ class DoclingQdrantService:
                         results['failed'] += 1
                         continue
                 
-                # Batch insert with error handling
+                # Batch insert with error handling and circuit breaker protection
                 try:
-                    await asyncio.to_thread(
-                        self.client.upsert,
-                        self.collection_name,
-                        batch_points
-                    )
+                    async with self._breaker:
+                        await asyncio.to_thread(
+                            self.client.upsert,
+                            self.collection_name,
+                            batch_points
+                        )
                     inserted_count += len(batch_points)
                     results['inserted'] += len(batch_points)
                     print(f"[INFO] Inserted batch {i//batch_size + 1}: {len(batch_points)} vectors")
@@ -1449,16 +1458,17 @@ class DoclingQdrantService:
             
             query_filter = Filter(must=filter_conditions)
             
-            # Perform search (blocking I/O operation)
-            results = await asyncio.to_thread(
-                lambda: self.client.query_points(
-                    collection_name=self.collection_name,
-                    query=normalized_vector.tolist(),
-                    limit=top_k,
-                    with_payload=True,
-                    query_filter=query_filter
-                ).points
-            )
+            # Perform search with circuit breaker protection (blocking I/O operation)
+            async with self._breaker:
+                results = await asyncio.to_thread(
+                    lambda: self.client.query_points(
+                        collection_name=self.collection_name,
+                        query=normalized_vector.tolist(),
+                        limit=top_k,
+                        with_payload=True,
+                        query_filter=query_filter
+                    ).points
+                )
             
             # Process results
             search_results = []

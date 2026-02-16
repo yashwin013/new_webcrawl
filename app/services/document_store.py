@@ -11,7 +11,7 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 
 from app.config import get_logger
-from app.schemas.document import CrawledDocument, DocumentStatus, WebsiteCrawl, VisitedUrl, PdfDocument
+from app.schemas.document import CrawledDocument, DocumentStatus, WebsiteCrawl, VisitedUrl, PdfDocument, PageDocument
 
 logger = get_logger(__name__)
 
@@ -104,6 +104,7 @@ class DocumentStore:
         file_size: int = 0,
         crawl_depth: int = 0,
         status: DocumentStatus = DocumentStatus.PENDING,
+        file_id: Optional[str] = None,
     ) -> CrawledDocument:
         """
         Create a new document record.
@@ -116,11 +117,12 @@ class DocumentStore:
             file_size: File size in bytes
             crawl_depth: Depth in crawl tree
             status: Initial status (PENDING for chunking, STORED for storage only)
+            file_id: Optional custom file ID (auto-generated if not provided)
             
         Returns:
             Created document
         """
-        doc = CrawledDocument(
+        kwargs = dict(
             original_file=original_file,
             source_url=source_url,
             file_path=file_path,
@@ -129,6 +131,9 @@ class DocumentStore:
             crawl_depth=crawl_depth,
             status=status,
         )
+        if file_id:
+            kwargs["file_id"] = file_id
+        doc = CrawledDocument(**kwargs)
         
         collection = self._get_collection()
         mongo_doc = doc.to_mongo_dict()
@@ -455,10 +460,279 @@ class DocumentStore:
         
         if result.modified_count > 0 or not existing_url:
             logger.info(f"Added PDF {pdf_document.file_id} to {visited_url}")
+            
+            # Automatically update website-level is_crawled and is_visited flags
+            self._update_website_crawl_status(website_url, crawl_session_id)
+            
             return True
         
         return False
     
+    def add_page_to_website(
+        self,
+        website_url: str,
+        crawl_session_id: str,
+        visited_url: str,
+        crawl_depth: int,
+        page_document: "PageDocument"
+    ) -> bool:
+        """
+        Add a page (HTML or PDF) to a visited URL within a website.
+        Creates the website and visited URL if they don't exist.
+        
+        Args:
+            website_url: Base URL of the website
+            crawl_session_id: Session ID for this crawl
+            visited_url: The URL of the page
+            crawl_depth: Depth in crawl tree
+            page_document: The page document to add (HTML or PDF)
+            
+        Returns:
+            True if added, False on error
+        """
+        collection = self._get_websites_collection()
+        
+        # Check if this URL already has this document
+        existing = collection.find_one({
+            "websiteUrl": website_url,
+            "crawlSessionId": crawl_session_id,
+            "visitedUrls.url": visited_url,
+            "visitedUrls.documents.fileId": page_document.file_id
+        })
+        
+        if existing:
+            logger.debug(f"Document {page_document.file_id} already exists in {visited_url}")
+            # Update existing document instead of returning False
+            result = collection.update_one(
+                {
+                    "websiteUrl": website_url,
+                    "crawlSessionId": crawl_session_id,
+                    "visitedUrls.url": visited_url,
+                    "visitedUrls.documents.fileId": page_document.file_id
+                },
+                {
+                    "$set": {
+                        "visitedUrls.$[url].documents.$[doc]": page_document.to_mongo_dict(),
+                        "updatedAt": datetime.utcnow()
+                    }
+                },
+                array_filters=[
+                    {"url.url": visited_url},
+                    {"doc.fileId": page_document.file_id}
+                ]
+            )
+            
+            # Auto-update website status after updating existing document
+            self._update_website_crawl_status(website_url, crawl_session_id)
+            
+            return True
+        
+        # Check if the visited URL exists
+        existing_url = collection.find_one({
+            "websiteUrl": website_url,
+            "crawlSessionId": crawl_session_id,
+            "visitedUrls.url": visited_url
+        })
+        
+        if existing_url:
+            # Add document to existing URL
+            result = collection.update_one(
+                {
+                    "websiteUrl": website_url,
+                    "crawlSessionId": crawl_session_id,
+                    "visitedUrls.url": visited_url
+                },
+                {
+                    "$push": {"visitedUrls.$.documents": page_document.to_mongo_dict()},
+                    "$set": {"updatedAt": datetime.utcnow()}
+                }
+            )
+        else:
+            # Create new visited URL with the document
+            from app.schemas.document import VisitedUrl
+            visited_url_obj = VisitedUrl(
+                url=visited_url,
+                crawl_depth=crawl_depth,
+                documents=[page_document]
+            )
+            
+            # Check if website exists
+            website_exists = collection.find_one({
+                "websiteUrl": website_url,
+                "crawlSessionId": crawl_session_id
+            })
+            
+            if website_exists:
+                # Add visited URL to existing website
+                result = collection.update_one(
+                    {
+                        "websiteUrl": website_url,
+                        "crawlSessionId": crawl_session_id
+                    },
+                    {
+                        "$push": {"visitedUrls": visited_url_obj.to_mongo_dict()},
+                        "$set": {"updatedAt": datetime.utcnow()}
+                    }
+                )
+            else:
+                # Create new website with visited URL
+                from app.schemas.document import WebsiteCrawl
+                website = WebsiteCrawl(
+                    website_url=website_url,
+                    crawl_session_id=crawl_session_id,
+                    visited_urls=[visited_url_obj]
+                )
+                collection.insert_one(website.to_mongo_dict())
+                result = type('obj', (object,), {'modified_count': 1})()
+        
+        if result.modified_count > 0 or not existing_url:
+            logger.info(
+                f"Added {page_document.document_type.upper()} document {page_document.file_id} "
+                f"to {visited_url} in website {website_url}"
+            )
+            
+            # Automatically update website-level is_crawled and is_visited flags
+            self._update_website_crawl_status(website_url, crawl_session_id)
+            
+            return True
+        
+        return False
+    
+    def _update_website_crawl_status(
+        self,
+        website_url: str,
+        crawl_session_id: str
+    ) -> None:
+        """
+        Update website-level is_visited and is_crawled flags based on nested documents.
+        Called automatically after adding pages.
+        
+        Args:
+            website_url: Base URL of the website
+            crawl_session_id: Session ID for this crawl
+        """
+        collection = self._get_websites_collection()
+        
+        # Get the website document
+        website_doc = collection.find_one({
+            "websiteUrl": website_url,
+            "crawlSessionId": crawl_session_id
+        })
+        
+        if not website_doc:
+            return
+        
+        # Convert to WebsiteCrawl object and check status
+        from app.schemas.document import WebsiteCrawl
+        website = WebsiteCrawl.from_mongo_dict(website_doc)
+        is_visited, is_crawled = website.check_crawl_status()
+        
+        # Update in MongoDB if changed
+        if website.is_visited != is_visited or website.is_crawled != is_crawled:
+            collection.update_one(
+                {
+                    "websiteUrl": website_url,
+                    "crawlSessionId": crawl_session_id
+                },
+                {
+                    "$set": {
+                        "isVisited": is_visited,
+                        "isCrawled": is_crawled,
+                        "updatedAt": datetime.utcnow()
+                    }
+                }
+            )
+            logger.info(
+                f"Updated website status: {website_url} "
+                f"(isVisited={is_visited}, isCrawled={is_crawled})"
+            )
+    
+    def is_url_already_crawled(self, url: str) -> tuple[bool, Optional[dict]]:
+        """
+        Check if a URL has already been crawled at any depth level.
+        
+        Searches for the URL in:
+        - websiteUrl (top level)
+        - visitedUrls.url (nested)
+        - visitedUrls.documents.sourceUrl (deep nested)
+        
+        Args:
+            url: The URL to check
+            
+        Returns:
+            Tuple of (is_crawled, details):
+            - is_crawled: True if URL exists and has crawled documents
+            - details: Dict with crawl info (session_id, website_url, crawl_date) or None
+        """
+        from urllib.parse import urlparse
+        
+        collection = self._get_websites_collection()
+        
+        # Normalize URL for comparison (remove trailing slash, fragments)
+        parsed = urlparse(url)
+        normalized_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip('/')
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Search in multiple locations:
+        # 1. Check if it's the website base URL
+        # 2. Check if it's in visitedUrls array
+        # 3. Check if it's in documents.sourceUrl
+        
+        # First, try to find any website that contains this URL
+        query = {
+            "$or": [
+                {"websiteUrl": {"$in": [url, normalized_url, base_url]}},
+                {"visitedUrls.url": {"$in": [url, normalized_url]}},
+                {"visitedUrls.documents.sourceUrl": {"$in": [url, normalized_url]}}
+            ]
+        }
+        
+        website_docs = list(collection.find(query))
+        
+        if not website_docs:
+            return False, None
+        
+        # Check if any of the found websites have crawled documents
+        for website_doc in website_docs:
+            website_url = website_doc.get("websiteUrl", "")
+            crawl_session_id = website_doc.get("crawlSessionId", "")
+            visited_urls = website_doc.get("visitedUrls", [])
+            
+            # Check if this specific URL or base URL is crawled
+            for visited in visited_urls:
+                visited_url = visited.get("url", "")
+                
+                # Check if this is the URL we're looking for
+                if visited_url in [url, normalized_url] or website_url in [url, normalized_url, base_url]:
+                    documents = visited.get("documents", [])
+                    
+                    # If there are documents and at least one is crawled
+                    if documents:
+                        crawled_docs = [d for d in documents if d.get("isCrawled") == "1"]
+                        if crawled_docs:
+                            return True, {
+                                "website_url": website_url,
+                                "crawl_session_id": crawl_session_id,
+                                "visited_url": visited_url,
+                                "crawled_at": website_doc.get("updatedAt"),
+                                "total_documents": len(documents),
+                                "crawled_documents": len(crawled_docs),
+                                "is_fully_crawled": website_doc.get("isCrawled") == "1"
+                            }
+            
+            # Also check website-level status
+            if website_doc.get("isCrawled") == "1" and website_url in [url, normalized_url, base_url]:
+                return True, {
+                    "website_url": website_url,
+                    "crawl_session_id": crawl_session_id,
+                    "visited_url": website_url,
+                    "crawled_at": website_doc.get("updatedAt"),
+                    "total_urls": len(visited_urls),
+                    "is_fully_crawled": True
+                }
+        
+        return False, None
+
     def get_website_by_session(self, crawl_session_id: str) -> List[WebsiteCrawl]:
         """Get all websites from a crawl session."""
         collection = self._get_websites_collection()

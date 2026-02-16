@@ -307,8 +307,64 @@ class MultiSiteOrchestrator:
         logger.info(f"Websites to crawl: {len(website_urls)}")
         logger.info("="*70)
         
+        # Check if any URLs have already been crawled
+        from app.services.document_store import DocumentStore
+        document_store = DocumentStore.from_config()
+        
+        urls_to_crawl = []
+        already_crawled = []
+        
+        for url in website_urls:
+            is_crawled, details = await asyncio.to_thread(
+                document_store.is_url_already_crawled, url
+            )
+            if is_crawled:
+                already_crawled.append((url, details))
+                logger.info(
+                    f"⚠ SKIPPING {url} - Already crawled on "
+                    f"{details.get('crawled_at', 'unknown date')} "
+                    f"(Session: {details.get('crawl_session_id', 'N/A')[:8]}...)"
+                )
+            else:
+                urls_to_crawl.append(url)
+                logger.info(f"✓ Queuing {url} for crawling")
+        
+        # Report results
+        if already_crawled:
+            logger.info("="*70)
+            logger.info(f" Duplicate Detection Summary:")
+            logger.info(f"   Total URLs submitted: {len(website_urls)}")
+            logger.info(f"   Already crawled: {len(already_crawled)}")
+            logger.info(f"   New URLs to crawl: {len(urls_to_crawl)}")
+            logger.info("="*70)
+            
+            if already_crawled:
+                logger.info("\n Previously Crawled URLs:")
+                for url, details in already_crawled:
+                    logger.info(f"   • {url}")
+                    logger.info(f"     Session: {details.get('crawl_session_id', 'N/A')}")
+                    logger.info(f"     Crawled: {details.get('crawled_at', 'N/A')}")
+                    if details.get('is_fully_crawled'):
+                        logger.info(f"     Status: ✓ Fully crawled")
+                    else:
+                        logger.info(
+                            f"     Status: Partial ({details.get('crawled_documents', 0)}/"
+                            f"{details.get('total_documents', 0)} documents)"
+                        )
+                logger.info("="*70)
+        
+        # If all URLs were already crawled, exit early
+        if not urls_to_crawl:
+            logger.warning("⚠ All URLs have already been crawled. Nothing to do.")
+            self.stats.websites_completed = len(already_crawled)
+            return
+        
+        # Update stats with only new URLs
+        self.websites = urls_to_crawl
+        self.stats.total_websites = len(urls_to_crawl)
+        
         # Create crawl tasks for each website
-        for idx, url in enumerate(website_urls):
+        for idx, url in enumerate(urls_to_crawl):
             task = CrawlTask(
                 task_id=f"{crawl_session_id}-crawl-{idx+1}",
                 website_url=url,
@@ -339,7 +395,14 @@ class MultiSiteOrchestrator:
         # Grace period: Give workers time to start and grab tasks
         # Wait 15 seconds before any completion checks
         logger.info("Waiting 15 seconds for workers to start processing...")
-        await asyncio.sleep(15)
+        
+        # Check for shutdown during grace period (in 1-second intervals)
+        for _ in range(15):
+            if self._shutdown_event.is_set():
+                logger.info("Shutdown signal received during grace period")
+                return
+            await asyncio.sleep(1)
+        
         logger.info("Grace period complete. Monitoring work progress...")
         
         # Track last progress to detect deadlocks
@@ -387,8 +450,12 @@ class MultiSiteOrchestrator:
             # Log progress
             await self._log_progress()
             
-            # Wait before next check
-            await asyncio.sleep(self.config.monitoring_interval_seconds)
+            # Wait before next check (check shutdown every second)
+            for _ in range(self.config.monitoring_interval_seconds):
+                if self._shutdown_event.is_set():
+                    logger.info("Shutdown signal received during monitoring")
+                    return
+                await asyncio.sleep(1)
     
     async def _is_work_complete(self) -> bool:
         """Check if all work is complete."""

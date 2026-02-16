@@ -117,7 +117,12 @@ def parse_sitemap(base_url: str, timeout: int = 30) -> Set[str]:
     def fetch_sitemap(sitemap_url: str) -> None:
         """Fetch and parse a single sitemap."""
         try:
-            response = requests.get(sitemap_url, timeout=timeout)
+            # Use provided timeout or fall back to centralized config
+            from app.core.timeouts import TimeoutConfig
+            timeout_config = TimeoutConfig()
+            actual_timeout = timeout if timeout else timeout_config.CRAWLER_PAGE_LOAD
+            
+            response = requests.get(sitemap_url, timeout=actual_timeout)
             response.raise_for_status()
             
             # Parse XML

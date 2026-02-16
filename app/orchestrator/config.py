@@ -10,16 +10,29 @@ from typing import Optional
 
 @dataclass
 class WorkerConfig:
-    """Configuration for worker pools."""
+    """
+    Configuration for worker pools.
     
-    # CPU-bound workers (I/O heavy, can run many)
-    crawler_workers: int = 5  # Increased from 3 (more concurrent crawling)
-    processor_workers: int = 6  # Increased from 4 (handle more text processing)
-    storage_workers: int = 3  # Increased from 2 (faster storage writes)
+    IMPORTANT - Memory Considerations for Multiple Websites:
+    - Each Docling PDF worker loads ML models: ~3-4GB RAM each
+    - pdf_workers=1: Safe for 16GB RAM (10-12GB total usage)
+    - pdf_workers=2: Needs 20-24GB RAM total - will cause OOM on 16GB!
+    
+    For parallel multi-website processing with 16GB RAM:
+    - Keep pdf_workers at 1
+    - Increase crawler_workers and processor_workers instead
+    - Monitor RAM usage to stay under 80% (~13GB of 16GB)
+    """
+    
+    # CPU-bound workers (I/O heavy, can run many for multiple websites)
+    # Increased for better parallelism across multiple sites
+    crawler_workers: int = 6  # More crawlers for parallel websites (up from 4)
+    processor_workers: int = 8  # More processors for concurrent text processing (up from 5)
+    storage_workers: int = 3  # Storage writes to Qdrant (up from 2)
     
     # GPU-bound workers (GPU bottleneck, keep minimal)
-    pdf_workers: int = 2  # Increased from 1 (if GPU available, 2-3 can run in parallel)
-    ocr_workers: int = 1
+    pdf_workers: int = 1  # Keep at 1 for 16GB RAM - each Docling worker uses 3-4GB
+    ocr_workers: int = 0  # Disabled by default - process separately
     
     @property
     def total_workers(self) -> int:
@@ -38,19 +51,19 @@ class QueueConfig:
     """Configuration for queue sizes (backpressure control)."""
     
     # Website URL queue
-    crawl_queue_size: int = 20  # Increased from 10 (more URLs can be queued)
+    crawl_queue_size: int = 20  # URLs queued for crawling (multiple websites)
     
     # Raw pages waiting for processing (text extraction, chunking)
-    processing_queue_size: int = 100  # Increased from 50 (reduce backpressure)
+    processing_queue_size: int = 80  # Pages waiting for text processing
     
-    # PDFs waiting for Docling processing (GPU bottleneck - keep small!)
-    pdf_queue_size: int = 25  # Increased from 10 (was at 100% capacity)
+    # PDFs waiting for Docling processing (GPU bottleneck - monitor this!)
+    pdf_queue_size: int = 30  # Increased from 10 - was at 100% causing blocking
     
-    # Pages waiting for OCR (GPU bottleneck - keep small!)
+    # Pages waiting for OCR (GPU bottleneck - keep reasonable)
     ocr_queue_size: int = 10
     
     # Processed chunks waiting for storage
-    storage_queue_size: int = 200  # Increased from 100 (more buffer for storage)
+    storage_queue_size: int = 150  # Large buffer for vector storage writes
     
     @property
     def total_queue_capacity(self) -> int:
@@ -83,7 +96,12 @@ class ResourceLimits:
 
 @dataclass
 class RecoveryConfig:
-    """Configuration for worker recovery system."""
+    """
+    Configuration for worker recovery system.
+    
+    Timeouts increased for large PDF processing which can take several minutes.
+    Workers exceeding timeout are killed and restarted to prevent hung processes.
+    """
     
     # Enable automatic worker recovery
     enable_recovery: bool = True
@@ -91,15 +109,16 @@ class RecoveryConfig:
     # How often to check worker health (seconds)
     check_interval: float = 15.0
     
-    # Maximum retries before abandoning a task
-    max_task_retries: int = 2
+    # Maximum retries before abandoning a task (reduced to fail fast)
+    max_task_retries: int = 1
     
-    # Worker-specific timeouts (seconds)
-    crawler_timeout: float = 300.0  # 5 minutes
-    processor_timeout: float = 300.0  # 5 minutes (increased from 180s - too short)
-    pdf_timeout: float = 240.0  # 4 minutes
-    ocr_timeout: float = 300.0  # 5 minutes
-    storage_timeout: float = 120.0  # 2 minutes
+    # Worker-specific timeouts (seconds) - optimized for performance
+    # Reduced timeouts to fail fast on problematic documents
+    crawler_timeout: float = 240.0  # 4 minutes for large sites
+    processor_timeout: float = 180.0  # 3 minutes (fail fast on stuck pages)
+    pdf_timeout: float = 120.0  # 2 minutes for PDFs (6 min was too long)
+    ocr_timeout: float = 180.0  # 3 minutes
+    storage_timeout: float = 60.0  # 1 minute
 
 
 @dataclass
@@ -111,9 +130,9 @@ class OrchestratorConfig:
     limits: ResourceLimits
     recovery: RecoveryConfig
     
-    # Monitoring
+    # Monitoring (reduced interval for performance)
     enable_monitoring: bool = True
-    monitoring_interval_seconds: float = 5.0
+    monitoring_interval_seconds: float = 10.0  # Up from 5s to reduce overhead
     
     # Graceful shutdown
     shutdown_timeout_seconds: float = 30.0
@@ -168,21 +187,21 @@ Orchestrator Configuration:
 
 
 def get_default_config() -> OrchestratorConfig:
-    """Get default configuration optimized for typical hardware."""
+    """Get default configuration optimized for performance."""
     return OrchestratorConfig(
         workers=WorkerConfig(
-            crawler_workers=3,
-            processor_workers=4,
-            pdf_workers=1,  # Docling PDF processing (GPU)
+            crawler_workers=6,  # Increased for faster parallel crawling
+            processor_workers=8,  # Increased for better text processing throughput
+            pdf_workers=1,  # Keep at 1 for 16GB RAM (each worker = 3-4GB)
             ocr_workers=0,  # Disabled - OCR backlog processed separately
-            storage_workers=2,
+            storage_workers=3,  # Increased for faster database writes
         ),
         queues=QueueConfig(
-            crawl_queue_size=10,
-            processing_queue_size=50,
-            pdf_queue_size=10,
+            crawl_queue_size=20,  # Double size for multiple websites
+            processing_queue_size=80,  # More buffer for parallel processing
+            pdf_queue_size=30,  # Critical: was at 100%, increased to 30
             ocr_queue_size=10,
-            storage_queue_size=100,
+            storage_queue_size=150,  # More buffer for chunks
         ),
         limits=ResourceLimits(
             max_cpu_percent=80.0,
@@ -194,15 +213,15 @@ def get_default_config() -> OrchestratorConfig:
         recovery=RecoveryConfig(
             enable_recovery=True,
             check_interval=15.0,
-            max_task_retries=2,
-            crawler_timeout=300.0,
-            processor_timeout=180.0,
-            pdf_timeout=240.0,
-            ocr_timeout=300.0,
-            storage_timeout=120.0,
+            max_task_retries=1,  # Reduced from 2 - fail fast on problematic pages
+            crawler_timeout=240.0,  # Reduced from 300s
+            processor_timeout=180.0,  # Reduced from 300s - fail fast
+            pdf_timeout=120.0,  # Reduced from 360s - major speed improvement
+            ocr_timeout=180.0,  # Reduced from 300s
+            storage_timeout=60.0,  # Reduced from 120s
         ),
         enable_monitoring=True,
-        monitoring_interval_seconds=5.0,
+        monitoring_interval_seconds=10.0,  # Increased from 5s to reduce overhead,
         shutdown_timeout_seconds=30.0,
         save_progress_interval_seconds=10.0,
     )

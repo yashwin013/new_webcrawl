@@ -11,6 +11,7 @@ from datetime import datetime
 
 from app.config import get_logger
 from app.orchestrator.queues import QueueManager
+from app.core.backoff import ExponentialBackoff
 
 logger = get_logger(__name__)
 
@@ -58,6 +59,10 @@ class BaseWorker(ABC):
         self.tasks_processed = 0
         self.tasks_failed = 0
         self.start_time: Optional[datetime] = None
+        
+        # Exponential backoff for consecutive errors
+        self._error_backoff = ExponentialBackoff(base_delay=1.0, max_delay=30.0)
+        self._consecutive_errors = 0
     
     @property
     def is_busy(self) -> bool:
@@ -136,6 +141,7 @@ class BaseWorker(ABC):
                     if task is None:
                         # No task available, wait a bit
                         await asyncio.sleep(0.5)
+                        self._consecutive_errors = 0  # Reset on idle
                         continue
                     
                     # Mark as busy before processing
@@ -148,8 +154,10 @@ class BaseWorker(ABC):
                         
                         if success:
                             self.tasks_processed += 1
+                            self._consecutive_errors = 0  # Reset on success
                         else:
                             self.tasks_failed += 1
+                            self._consecutive_errors += 1
                     finally:
                         # Mark as idle after processing
                         self._is_busy = False
@@ -163,7 +171,10 @@ class BaseWorker(ABC):
                 except Exception as e:
                     logger.error(f"[{self.worker_id}] Unexpected error: {e}", exc_info=True)
                     self.tasks_failed += 1
-                    await asyncio.sleep(1)  # Backoff on error
+                    self._consecutive_errors += 1
+                    
+                    # Use exponential backoff on consecutive errors
+                    await self._error_backoff.wait(self._consecutive_errors - 1)
                     
         finally:
             await self.shutdown()

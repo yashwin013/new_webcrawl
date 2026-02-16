@@ -5,6 +5,7 @@ Processes PDF files using Docling (GPU) to extract text.
 GPU-intensive worker - should have minimal concurrency (1-2 workers max).
 """
 
+import aiofiles
 import asyncio
 import time
 from typing import Optional
@@ -115,6 +116,13 @@ class PdfProcessorWorker(BaseWorker):
                     f"[{self.worker_id}] Extracted {len(text)} chars ({word_count} words) from PDF "
                     f"in {processing_time:.2f}s: {page.url}"
                 )
+                
+                # Optional: Save as markdown file
+                # Extract file_id from URL or use PDF filename
+                file_id = page.url_hash if hasattr(page, 'url_hash') else pdf_path.stem
+                markdown_path = await self._save_markdown(pdf_path, file_id)
+                if markdown_path:
+                    logger.info(f"[{self.worker_id}] Saved markdown: {markdown_path}")
                 
                 # Chunk the text
                 chunks = chunk_page_text(
@@ -229,6 +237,54 @@ class PdfProcessorWorker(BaseWorker):
             return result.export_to_markdown()
         
         return ""
+    
+    async def _save_markdown(self, pdf_path: Path, file_id: str) -> Optional[Path]:
+        """
+        Extract and save PDF as markdown file.
+        
+        Args:
+            pdf_path: Path to PDF file
+            file_id: Unique identifier for the file
+            
+        Returns:
+            Path to saved markdown file, or None if failed
+        """
+        try:
+            # Lazy initialization of Docling processor with GPU
+            if self._docling_processor is None:
+                self._docling_processor = AsyncDocumentProcessor(
+                    use_gpu=True,
+                    executor=None,
+                    skip_ocr=True,
+                )
+            
+            # Convert document
+            result = await self._docling_processor.convert_document_async(
+                str(pdf_path)
+            )
+            
+            # Export to markdown
+            if result and hasattr(result, 'export_to_markdown'):
+                markdown_content = result.export_to_markdown()
+                
+                # Create markdown output directory
+                markdown_dir = Path("outputs/markdown")
+                markdown_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Save markdown file
+                markdown_path = markdown_dir / f"{file_id}.md"
+                import aiofiles
+                async with aiofiles.open(markdown_path, 'w', encoding='utf-8') as f:
+                    await f.write(markdown_content)
+                
+                logger.info(f"[{self.worker_id}] Saved markdown: {markdown_path}")
+                return markdown_path
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"[{self.worker_id}] Failed to save markdown: {e}", exc_info=True)
+            return None
     
     async def _save_to_ocr_backlog(self, page: Page, website_url: str):
         """Save page to OCR backlog for Phase 2 processing."""

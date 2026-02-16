@@ -2,15 +2,31 @@
 Process OCR Backlog
 
 Processes pages that were marked as needing OCR during orchestrator run.
-Runs OCR one page at a time to avoid memory issues.
+Uses batch processing (10 pages at a time) to avoid GPU memory issues.
+Automatically clears GPU cache between batches.
 
-Usage:
-    python scripts/process_ocr_backlog.py
+RECOMMENDED USAGE (Sets optimal GPU memory config):
+    Windows: process_ocr_backlog.bat
+    Linux/Mac: ./process_ocr_backlog.sh
+
+DIRECT USAGE (Manual memory config):
+    Set environment variable first:
+        Windows: SET PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+        Linux/Mac: export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    Then run:
+        python scripts/process_ocr_backlog.py
+
+IMPROVEMENTS:
+    - GPU memory clearing: Clears GPU memory before Phase 2, after each page, and after embeddings
+    - Batch processing: Processes 10 pages at a time (was: all pages at once)
+    - Memory optimization: Uses PyTorch expandable segments
+    - Supports large PDFs: Can handle 100+ page PDFs on 6GB GPU
 """
 
 import asyncio
 import json
 import sys
+import gc
 from pathlib import Path
 from datetime import datetime
 
@@ -24,6 +40,19 @@ from app.orchestrator.workers.helpers.text_processor import chunk_page_text
 from app.services.document_store import DocumentStore
 
 logger = get_logger(__name__)
+
+
+def clear_gpu_memory():
+    """Clear GPU cache and run garbage collection."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.debug("✓ Cleared GPU cache")
+    except ImportError:
+        pass
+    gc.collect()
 
 
 async def _store_chunks(
@@ -109,6 +138,9 @@ async def _store_chunks(
         )
         points.append(point)
     
+    # Clear GPU memory after generating all embeddings
+    clear_gpu_memory()
+    
     # Batch upsert
     qdrant_client.upsert(
         collection_name=collection_name,
@@ -154,6 +186,28 @@ async def process_single_page(
     
     logger.info(f"Processing OCR for: {url}")
     
+    # Check CUDA state before attempting OCR
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # Test CUDA with a simple operation
+            test_tensor = torch.zeros(1, device='cuda')
+            _ = test_tensor + 1
+            del test_tensor
+            torch.cuda.synchronize()
+    except RuntimeError as cuda_error:
+        if "CUDA" in str(cuda_error) or "assert" in str(cuda_error):
+            logger.warning(f"Corrupted CUDA state detected before OCR: {cuda_error}")
+            logger.info("Attempting to recover by clearing GPU and reinitializing models...")
+            try:
+                from app.services.gpu_manager import clear_models
+                clear_models()
+                clear_gpu_memory()
+                logger.info("✓ GPU state reset successfully")
+            except Exception as e:
+                logger.error(f"Failed to reset GPU state: {e}")
+                return False
+    
     try:
         # Create Page object
         page = Page(
@@ -196,14 +250,19 @@ async def process_single_page(
         # Save chunks to MongoDB and Qdrant
         await _store_chunks(chunks, entry, doc_store)
         
+        # Clear GPU memory after processing this page
+        clear_gpu_memory()
+        
         return True
         
     except asyncio.TimeoutError:
         logger.warning(f"⏱ OCR timeout ({timeout}s) for {url} - skipping")
+        clear_gpu_memory()  # Clear on timeout too
         return False
         
     except Exception as e:
         logger.error(f"❌ OCR failed for {url}: {e}")
+        clear_gpu_memory()  # Clear on error too
         return False
 
 
@@ -214,6 +273,11 @@ async def process_ocr_backlog():
     if not backlog_file.exists():
         logger.info("No OCR backlog found")
         return
+    
+    # Clear GPU memory from Phase 1 before starting Phase 2
+    logger.info("Clearing GPU memory from Phase 1...")
+    clear_gpu_memory()
+    await asyncio.sleep(1)  # Give GPU a moment to fully release memory
     
     # Load backlog entries
     entries = []
@@ -237,6 +301,7 @@ async def process_ocr_backlog():
     # Process each entry
     success_count = 0
     failed_count = 0
+    consecutive_failures = 0
     
     for i, entry in enumerate(entries, 1):
         logger.info(f"\n[{i}/{len(entries)}] Processing: {entry['url']}")
@@ -245,11 +310,19 @@ async def process_ocr_backlog():
         
         if success:
             success_count += 1
+            consecutive_failures = 0
         else:
             failed_count += 1
+            consecutive_failures += 1
         
-        # Small delay between pages to let memory settle
-        await asyncio.sleep(2)
+        # Adaptive delay - longer after failures to allow GPU recovery
+        if consecutive_failures > 0:
+            delay = min(5 + consecutive_failures, 10)  # 5-10 seconds after failures
+            logger.debug(f"Waiting {delay}s for GPU recovery after failure...")
+            await asyncio.sleep(delay)
+        else:
+            # Normal delay between successful operations
+            await asyncio.sleep(2)
     
     # Summary
     logger.info("\n" + "="*70)

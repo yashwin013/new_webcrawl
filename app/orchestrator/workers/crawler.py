@@ -13,7 +13,7 @@ from app.orchestrator.workers.base import BaseWorker
 from app.orchestrator.queues import QueueManager
 from app.orchestrator.models.task import CrawlTask, ProcessTask, TaskPriority
 from app.crawling.stages.crawler import CrawlerStage
-from app.crawling.models.document import Document
+from app.crawling.models.document import Document, Page
 from app.crawling.models.config import PipelineConfig
 
 logger = get_logger(__name__)
@@ -26,7 +26,7 @@ class CrawlerWorker(BaseWorker):
     Responsibilities:
     - Pull CrawlTask from crawl_queue
     - Crawl website using CrawlerStage
-    - Push individual pages to processing_queue
+    - Push individual pages to processing_queue (streaming as discovered)
     - Update MongoDB with crawl status
     """
     
@@ -39,6 +39,8 @@ class CrawlerWorker(BaseWorker):
         super().__init__(worker_id, queue_manager)
         self.config = config or PipelineConfig()
         self.crawler_stage = CrawlerStage(self.config)
+        self._current_task: Optional[CrawlTask] = None
+        self._pages_queued = 0
     
     @property
     def worker_type(self) -> str:
@@ -59,9 +61,39 @@ class CrawlerWorker(BaseWorker):
         """Get next crawl task from queue."""
         return await self.queue_manager.get_crawl_task(timeout=1.0)
     
+    async def _on_page_crawled(self, page: Page) -> None:
+        """
+        Callback when a page is successfully crawled.
+        Immediately queues the page for processing (streaming approach).
+        
+        Args:
+            page: The crawled page with content
+        """
+        if not self._current_task:
+            return
+        
+        # Only queue pages with content
+        if page.html_content or page.pdf_path or page.dom_text:
+            process_task = ProcessTask(
+                task_id=f"{self._current_task.task_id}_page_{page.url_hash}",
+                page=page,
+                website_url=self._current_task.website_url,
+                crawl_session_id=self._current_task.crawl_session_id,
+                priority=self._current_task.priority,
+            )
+            
+            await self.queue_manager.put_process_task(process_task)
+            self._pages_queued += 1
+            logger.info(
+                f"[{self.worker_id}] ✓ Queued page {self._pages_queued}: {page.url[:60]}"
+            )
+    
     async def process_task(self, task: CrawlTask) -> bool:
         """
-        Crawl a website and push pages to processing queue.
+        Crawl a website and push pages to processing queue (streaming).
+        
+        Pages are queued immediately as they're discovered, allowing
+        downstream workers to start processing while crawling continues.
         
         Args:
             task: CrawlTask with website URL
@@ -78,6 +110,8 @@ class CrawlerWorker(BaseWorker):
             return False
         
         task.mark_started(self.worker_id)
+        self._current_task = task
+        self._pages_queued = 0
         
         logger.info(
             f"[{self.worker_id}] Crawling {task.website_url} "
@@ -93,7 +127,10 @@ class CrawlerWorker(BaseWorker):
                 max_pages=task.max_pages,
             )
             
-            # Run crawler (this will discover and download pages)
+            # Set callback for streaming pages
+            self.crawler_stage.on_page_crawled = self._on_page_crawled
+            
+            # Run crawler (will stream pages to processing queue via callback)
             document = await self.crawler_stage.process(document)
             
             # Update task progress
@@ -101,32 +138,13 @@ class CrawlerWorker(BaseWorker):
             task.pages_crawled = len([p for p in document.pages if p.html_content or p.pdf_path])
             
             logger.info(
-                f"[{self.worker_id}] Crawled {task.pages_crawled}/{task.pages_discovered} pages "
-                f"from {task.website_url}"
-            )
-            
-            # Push each page to processing queue
-            pages_queued = 0
-            for page in document.pages:
-                # Only queue pages with content
-                if page.html_content or page.pdf_path or page.dom_text:
-                    process_task = ProcessTask(
-                        task_id=f"{task.task_id}_page_{page.url_hash}",
-                        page=page,
-                        website_url=task.website_url,
-                        crawl_session_id=task.crawl_session_id,
-                        priority=task.priority,
-                    )
-                    
-                    await self.queue_manager.put_process_task(process_task)
-                    pages_queued += 1
-            
-            logger.info(
-                f"[{self.worker_id}] Queued {pages_queued} pages for processing"
+                f"[{self.worker_id}] Crawl complete: {task.pages_crawled}/{task.pages_discovered} pages, "
+                f"{self._pages_queued} queued for processing"
             )
             
             # Mark task complete
             task.mark_completed()
+            self._current_task = None
             return True
             
         except Exception as e:

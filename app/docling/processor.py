@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 
 from typing import Iterable, Optional, List, Tuple
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from docling_core.transforms.chunker.base import BaseChunk
@@ -92,7 +93,7 @@ class AsyncDocumentProcessor:
         
         # CRITICAL FIX: Cache DocumentConverter to prevent re-initialization
         self._document_converter: Optional[DocumentConverter] = None
-        self._converter_lock = asyncio.Lock()  # Ensure thread-safe access
+        self._converter_lock = threading.Lock()  # Thread-safe lock for executor
     
     @classmethod
     async def from_config(cls,_executor: Optional[ThreadPoolExecutor] = None):
@@ -165,9 +166,9 @@ class AsyncDocumentProcessor:
         logger.info(f"Pipeline options: OCR={pipeline_options.do_ocr}, GPU={self.use_gpu}")
         return pipeline_options
     
-    async def _get_or_create_converter(self) -> DocumentConverter:
-        """Get cached DocumentConverter or create new one (thread-safe)."""
-        async with self._converter_lock:
+    def _get_or_create_converter_sync(self) -> DocumentConverter:
+        """Get cached DocumentConverter or create new one (thread-safe synchronous)."""
+        with self._converter_lock:
             if self._document_converter is None:
                 logger.info("Initializing DocumentConverter (ONE TIME)...")
                 pipeline_options = self._configure_pipeline_options()
@@ -199,38 +200,41 @@ class AsyncDocumentProcessor:
         if file_size_mb > 50:
             logger.warning(f"Large PDF detected ({file_size_mb:.2f} MB). This may take several minutes...")
         
-        # CRITICAL FIX: Use cached converter instead of creating new one
-        converter = await self._get_or_create_converter()
+        # Run conversion in executor with proper thread-safe serialization
+        loop = asyncio.get_event_loop()
         
-        # CRITICAL FIX: Serialize conversions to prevent concurrent model access
-        async with self._converter_lock:
-            # Run conversion in executor (blocking operation) with timeout
-            loop = asyncio.get_event_loop()
+        from app.core.timeouts import TimeoutConfig
+        timeout_config = TimeoutConfig()
+        
+        # Wrapper function that acquires converter inside the thread
+        def _convert():
+            # Get converter with thread-safe lock
+            converter = self._get_or_create_converter_sync()
+            return converter.convert(source=pdf_path)
+        
+        try:
+            # Increase timeout for large PDFs (scale with file size)
+            timeout = min(timeout_config.PDF_PROCESSING * (1 + file_size_mb / 50), 600)
             
-            try:
-                # Add 5 minute timeout for conversion (adjust as needed)
-                # REDUCED TIMEOUT: 2 minutes instead of 5 to prevent hanging
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        self.executor,
-                        lambda: converter.convert(source=pdf_path)
-                    ),
-                    timeout=120.0  # 2 minutes - prevent long hangs
-                )
+            # Run conversion in executor with timeout
+            result = await asyncio.wait_for(
+                loop.run_in_executor(self.executor, _convert),
+                timeout=timeout
+            )
                 
-                self.doc = result.document
-                logger.info(f"Document converted successfully: {pdf_path}")
-                return self.doc
-                
-            except asyncio.TimeoutError:
-                logger.error(f"Document conversion timed out after 300s: {pdf_path}")
-                raise TimeoutError(f"Document conversion took too long (>5min): {pdf_path}")
-            except Exception as e:
-                logger.error(f"Document conversion failed: {e}", exc_info=True)
-                raise
-            finally:
-                # Always cleanup GPU memory after conversion attempt
-                await self._cleanup_gpu_memory()
+            self.doc = result.document
+            logger.info(f"Document converted successfully: {pdf_path} ({file_size_mb:.2f} MB)")
+            return self.doc
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Document conversion timed out after {timeout:.1f}s: {pdf_path} ({file_size_mb:.2f} MB)")
+            raise TimeoutError(f"Document conversion took too long (>{timeout:.1f}s): {pdf_path}")
+        except Exception as e:
+            logger.error(f"Document conversion failed: {e}", exc_info=True)
+            raise
+        finally:
+            # Always cleanup GPU memory after conversion attempt
+            await self._cleanup_gpu_memory()
     
     async def create_chunks_async(self) -> List[BaseChunk]:
         """Create chunks asynchronously"""

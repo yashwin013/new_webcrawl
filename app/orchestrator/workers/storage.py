@@ -5,6 +5,7 @@ Stores processed chunks to MongoDB and Qdrant.
 CPU-intensive worker for database operations.
 """
 
+import asyncio
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -71,11 +72,15 @@ class StorageWorker(BaseWorker):
         
         try:
             # Step 1: Check if document exists
-            doc = self.document_store.get_by_source_url(task.document_metadata.get("url", ""))
+            doc = await asyncio.to_thread(
+                self.document_store.get_by_source_url,
+                task.document_metadata.get("url", "")
+            )
             
             if not doc:
                 # Create new document record
-                doc = self.document_store.create_document(
+                doc = await asyncio.to_thread(
+                    self.document_store.create_document,
                     original_file=task.document_metadata.get("url", "unknown"),
                     source_url=task.document_metadata.get("url", ""),
                     file_path="",  # Web page, no file
@@ -112,7 +117,7 @@ class StorageWorker(BaseWorker):
             update_data["processed_by_worker"] = self.worker_id
             
             # Update document
-            self.document_store.update_document(doc.file_id, update_data)
+            await asyncio.to_thread(self.document_store.update_document, doc.file_id, update_data)
             
             # Step 3: Store chunks to Qdrant with embeddings
             if task.chunks:
@@ -190,7 +195,8 @@ class StorageWorker(BaseWorker):
             
             # Step 4: Mark document as vectorized
             if task.chunks:
-                self.document_store.update_document(
+                await asyncio.to_thread(
+                    self.document_store.update_document,
                     doc.file_id,
                     {
                         "is_vectorized": "1",
@@ -201,9 +207,63 @@ class StorageWorker(BaseWorker):
                 )
             else:
                 # No chunks to vectorize
-                self.document_store.update_document(
+                await asyncio.to_thread(
+                    self.document_store.update_document,
                     doc.file_id,
                     {"status": DocumentStatus.STORED}
+                )
+            
+            # Step 5: Store in nested websites collection structure
+            try:
+                from app.schemas.document import PageDocument
+                from urllib.parse import urlparse
+                
+                source_url = task.document_metadata.get("url", "")
+                parsed_url = urlparse(source_url)
+                website_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                
+                # Create PageDocument for this HTML page
+                page_doc = PageDocument(
+                    file_id=doc.file_id,
+                    original_file=source_url,
+                    source_url=source_url,
+                    file_path="",  # HTML pages don't have file paths
+                    document_type="html",
+                    status=DocumentStatus.VECTORIZED if task.chunks else DocumentStatus.STORED,
+                    vector_count=len(task.chunks),
+                    file_size=0,
+                    page_count=1,
+                    mime_type="text/html",
+                    crawl_session_id=task.crawl_session_id,
+                    crawl_depth=task.document_metadata.get("depth", 0),
+                    is_deleted=False,
+                    is_crawled="1",
+                    is_vectorized="1" if task.chunks else "0",
+                    is_ocr_required="1" if ocr_completed else "0",
+                    is_ocr_completed="1" if ocr_completed else "0",
+                    total_pages=1,
+                    pages_with_text=1 if task.chunks else 0,
+                    pages_needing_ocr=1 if ocr_completed else 0,
+                )
+                
+                # Add page to nested websites structure
+                await asyncio.to_thread(
+                    self.document_store.add_page_to_website,
+                    website_url=website_url,
+                    crawl_session_id=task.crawl_session_id,
+                    visited_url=source_url,
+                    crawl_depth=task.document_metadata.get("depth", 0),
+                    page_document=page_doc
+                )
+                
+                logger.info(
+                    f"[{self.worker_id}] Added HTML page to nested websites structure: "
+                    f"{source_url} in {website_url}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{self.worker_id}] Failed to add page to websites structure: {e}",
+                    exc_info=True
                 )
             
             # Update statistics

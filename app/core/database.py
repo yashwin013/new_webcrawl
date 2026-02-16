@@ -12,8 +12,11 @@ from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorCollection
 
 from app.config import app_config
+from app.core.circuit_breaker import CircuitBreaker
+from app.core.timeouts import TimeoutConfig
 
 logger = logging.getLogger("database_manager")
+timeout_config = TimeoutConfig()
 
 
 class DatabaseManager:
@@ -34,6 +37,12 @@ class DatabaseManager:
     def __init__(self):
         """Initialize database manager (use get_instance() instead)."""
         self._is_connected = False
+        # Circuit breaker for MongoDB operations
+        self._breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=60,
+            success_threshold=2
+        )
         
     @classmethod
     def get_instance(cls) -> "DatabaseManager":
@@ -57,13 +66,14 @@ class DatabaseManager:
                     maxPoolSize=50,          # Max connections in pool
                     minPoolSize=10,          # Min connections to maintain
                     maxIdleTimeMS=30000,     # Close idle connections after 30s
-                    serverSelectionTimeoutMS=5000,  # Timeout for server selection
-                    connectTimeoutMS=10000,  # Timeout for initial connection
-                    socketTimeoutMS=20000,   # Timeout for socket operations
+                    serverSelectionTimeoutMS=timeout_config.MONGODB_SERVER_SELECTION,
+                    connectTimeoutMS=timeout_config.MONGODB_CONNECT,
+                    socketTimeoutMS=timeout_config.MONGODB_SOCKET,
                 )
                 
-                # Test connection
-                await self._client.admin.command('ping')
+                # Test connection with circuit breaker
+                async with self._breaker:
+                    await self._client.admin.command('ping')
                 self._is_connected = True
                 logger.info(f"✓ Connected to MongoDB: {app_config.MONGODB_DATABASE}")
                 logger.info(f"  Pool: {10}-{50} connections, 30s idle timeout")
@@ -137,7 +147,7 @@ class DatabaseManager:
         db_name: Optional[str] = None
     ):
         """
-        Context manager for safe collection access.
+        Context manager for safe collection access with circuit breaker protection.
         
         Usage:
             async with db_manager.collection_context("files") as collection:
@@ -151,8 +161,9 @@ class DatabaseManager:
             AsyncIOMotorCollection instance
         """
         try:
-            collection = self.get_collection(collection_name, db_name)
-            yield collection
+            async with self._breaker:
+                collection = self.get_collection(collection_name, db_name)
+                yield collection
         except Exception as e:
             logger.error(
                 f"Error in collection context '{collection_name}': {e}", 

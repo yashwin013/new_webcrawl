@@ -8,6 +8,7 @@ import aiofiles
 import uuid
 import asyncio
 import hashlib
+import sys
 import time
 from pathlib import Path
 from typing import Optional, Set, TYPE_CHECKING
@@ -49,6 +50,7 @@ class CrawlerStage(PipelineStage):
         self._rate_limiter: Optional[RateLimiter] = None
         self._content_filter: Optional[ContentFilter] = None
         self._robots: Optional[RobotsRules] = None
+        self.on_page_crawled = None  # Callback for streaming pages
     
     @property
     def name(self) -> str:
@@ -98,8 +100,20 @@ class CrawlerStage(PipelineStage):
         output_dir.mkdir(parents=True, exist_ok=True)
         
         crawl_config = self.config.crawl if self.config else None
-        max_depth = crawl_config.max_depth if crawl_config else 3
-        max_pages = crawl_config.max_pages if crawl_config else 50
+        
+        # CRITICAL: Use Document's max_pages/max_depth if provided (from API/orchestrator)
+        # Otherwise fall back to config defaults
+        if hasattr(document, 'max_pages') and document.max_pages:
+            max_pages = document.max_pages
+        else:
+            max_pages = crawl_config.max_pages if crawl_config else 50
+        
+        if hasattr(document, 'crawl_depth') and document.crawl_depth:
+            max_depth = document.crawl_depth
+        else:
+            max_depth = crawl_config.max_depth if crawl_config else 3
+        
+        logger.info(f"Crawl limits: max_pages={max_pages}, max_depth={max_depth}")
         
         base_domain = self._get_base_domain(start_url)
         document.start_time = time.time()
@@ -129,16 +143,134 @@ class CrawlerStage(PipelineStage):
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put((start_url, 0))  # (url, depth)
         
+        # CRITICAL: Only add sitemap URLs up to max_pages to respect the limit
+        sitemap_count = 0
         for url in discovered_urls:
             if self._is_same_domain(url, base_domain):
+                # Reserve 1 slot for start_url, so max sitemap URLs = max_pages - 1
+                if sitemap_count >= max_pages - 1:
+                    logger.info(f"Reached max_pages limit ({max_pages}), skipping remaining sitemap URLs")
+                    break
                 await queue.put((url, 1))
+                sitemap_count += 1
         
-        logger.info(f"Crawl queue initialized with {queue.qsize()} URLs (start_url + {len(discovered_urls)} from sitemap)")
+        logger.info(f"Crawl queue initialized with {queue.qsize()} URLs (start_url + {sitemap_count} from sitemap, max_pages={max_pages})")
         
         visited: Set[str] = set()
         pdf_mapping: dict = {}  # Maps pdf_url -> (referring_page_url, depth)
         
-        # Lazy import playwright
+        # On Windows, uvicorn defaults to SelectorEventLoop which does NOT
+        # support asyncio.create_subprocess_exec (raises NotImplementedError).
+        # Playwright needs subprocess support to launch its browser server.
+        # Detect this and run Playwright in a ProactorEventLoop thread.
+        if self._needs_proactor_workaround():
+            logger.info(
+                "Windows SelectorEventLoop detected — "
+                "running Playwright in a ProactorEventLoop thread"
+            )
+            await self._crawl_in_proactor_thread(
+                document, queue, visited, pdf_mapping,
+                max_pages, max_depth, output_dir, base_domain,
+            )
+        else:
+            await self._crawl_with_playwright(
+                document, queue, visited, pdf_mapping,
+                max_pages, max_depth, output_dir, base_domain,
+            )
+        
+        document.end_time = time.time()
+        logger.info(
+            f"Crawl complete: {document.pages_scraped} pages, "
+            f"{document.pdfs_downloaded} PDFs, "
+            f"{document.pages_failed} failed"
+        )
+        
+        return document
+    
+    # ─── Windows ProactorEventLoop workaround ────────────────────────
+    
+    @staticmethod
+    def _needs_proactor_workaround() -> bool:
+        """Return True when the running event loop lacks subprocess support (Windows)."""
+        if sys.platform != "win32":
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+            return not isinstance(loop, asyncio.ProactorEventLoop)
+        except RuntimeError:
+            return False
+    
+    async def _crawl_in_proactor_thread(
+        self,
+        document: "Document",
+        queue: asyncio.Queue,
+        visited: Set[str],
+        pdf_mapping: dict,
+        max_pages: int,
+        max_depth: int,
+        output_dir: Path,
+        base_domain: str,
+    ):
+        """
+        Run the Playwright crawl in a thread that owns a ProactorEventLoop.
+
+        This is the fallback for Windows + SelectorEventLoop (uvicorn default).
+        The on_page_crawled callback is bridged back to the calling loop via
+        ``asyncio.run_coroutine_threadsafe``.
+        """
+        main_loop = asyncio.get_running_loop()
+        original_callback = self.on_page_crawled
+        
+        # Bridge callback back to the main event loop (thread-safe)
+        if original_callback:
+            async def _bridged(page):
+                fut = asyncio.run_coroutine_threadsafe(original_callback(page), main_loop)
+                fut.result(timeout=60)
+            self.on_page_crawled = _bridged
+        
+        # Drain asyncio.Queue → plain list (Queues are bound to one loop)
+        url_items: list = []
+        while not queue.empty():
+            try:
+                url_items.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        
+        def _run() -> None:
+            loop = asyncio.ProactorEventLoop()
+            asyncio.set_event_loop(loop)
+            try:
+                new_queue: asyncio.Queue = asyncio.Queue()
+                for item in url_items:
+                    new_queue.put_nowait(item)
+                loop.run_until_complete(
+                    self._crawl_with_playwright(
+                        document, new_queue, visited, pdf_mapping,
+                        max_pages, max_depth, output_dir, base_domain,
+                    )
+                )
+            finally:
+                loop.close()
+        
+        try:
+            await main_loop.run_in_executor(None, _run)
+        finally:
+            self.on_page_crawled = original_callback
+    
+    # ─── Core Playwright crawling ────────────────────────────────────
+    
+    async def _crawl_with_playwright(
+        self,
+        document: "Document",
+        queue: asyncio.Queue,
+        visited: Set[str],
+        pdf_mapping: dict,
+        max_pages: int,
+        max_depth: int,
+        output_dir: Path,
+        base_domain: str,
+    ):
+        """Core crawling loop using Playwright."""
         from playwright.async_api import async_playwright
         
         async with async_playwright() as p:
@@ -189,6 +321,11 @@ class CrawlerStage(PipelineStage):
                     logger.info(f"Attempting to crawl: {url}")
                     page = await self._crawl_single_page(url, depth, output_dir)
                     document.add_page(page)
+                    
+                    # Stream page to callback if set (for orchestrator mode)
+                    if self.on_page_crawled:
+                        await self.on_page_crawled(page)
+                    
                     self._rate_limiter.success()
                     logger.info(f"Successfully crawled: {url} (found {len(page.html_content) if page.html_content else 0} chars)")
                     
@@ -208,7 +345,13 @@ class CrawlerStage(PipelineStage):
                                     await queue.put((link, depth + 1))
                                 
                 except Exception as e:
-                    logger.error(f"Failed to crawl {url}: {e}", exc_info=True)
+                    from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
+                    
+                    if isinstance(e, PlaywrightTimeoutError):
+                        logger.warning(f"Timeout crawling {url}, page took too long to load")
+                    else:
+                        logger.error(f"Failed to crawl {url}: {e}", exc_info=True)
+                    
                     self._rate_limiter.failure()
                     document.pages_failed += 1
             
@@ -218,19 +361,15 @@ class CrawlerStage(PipelineStage):
                     # Pass the referring page URL so PDF is nested under that page in MongoDB
                     pdf_page = await self._download_pdf(pdf_url, output_dir, current_page_url=referring_page, crawl_depth=depth)
                     document.add_page(pdf_page)
+                    
+                    # Stream PDF page to callback if set
+                    if self.on_page_crawled:
+                        await self.on_page_crawled(pdf_page)
+                    
                     logger.info(f"Downloaded PDF from page: {referring_page or 'direct'} -> {pdf_url}")
                 except Exception as e:
                     logger.error(f"Failed to download PDF {pdf_url}: {e}")
                     document.pages_failed += 1
-        
-        document.end_time = time.time()
-        logger.info(
-            f"Crawl complete: {document.pages_scraped} pages, "
-            f"{document.pdfs_downloaded} PDFs, "
-            f"{document.pages_failed} failed"
-        )
-        
-        return document
     
     async def _crawl_single_page(
         self, url: str, depth: int, output_dir: Path
@@ -238,10 +377,23 @@ class CrawlerStage(PipelineStage):
         """Crawl a single page and save content."""
         start_time = time.time()
         
+        from app.core.timeouts import TimeoutConfig
+        from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
+        timeout_config = TimeoutConfig()
+        
         page_obj = await self._context.new_page()
         try:
-            timeout = self.config.crawl.page_timeout_ms if self.config else 30000
-            await page_obj.goto(url, timeout=timeout, wait_until="networkidle")
+            timeout = self.config.crawl.page_timeout_ms if self.config else (timeout_config.CRAWLER_PAGE_LOAD * 1000)
+            
+            # Try networkidle first, fall back to domcontentloaded on timeout
+            try:
+                await page_obj.goto(url, timeout=timeout, wait_until="networkidle")
+            except PlaywrightTimeoutError:
+                logger.warning(f"Timeout waiting for networkidle on {url}, trying with domcontentloaded")
+                # Reload with more lenient wait condition
+                await page_obj.goto(url, timeout=timeout, wait_until="domcontentloaded")
+                # Give it a bit more time for dynamic content
+                await asyncio.sleep(2)
             
             # Get HTML content
             html_content = await page_obj.content()
@@ -374,6 +526,8 @@ class CrawlerStage(PipelineStage):
                         original_file=original_filename,
                         source_url=url,
                         file_path=str(pdf_path),
+                        document_type="pdf",
+                        mime_type="application/pdf",
                         crawl_session_id=crawl_session_id,
                         file_size=len(content),
                         crawl_depth=crawl_depth,
@@ -385,12 +539,13 @@ class CrawlerStage(PipelineStage):
                     )
                     
                     # Add PDF to website using nested structure
-                    store.add_pdf_to_website(
+                    await asyncio.to_thread(
+                        store.add_page_to_website,
                         website_url=website_url,
                         crawl_session_id=crawl_session_id,
                         visited_url=visited_url,
                         crawl_depth=crawl_depth,
-                        pdf_document=pdf_doc
+                        page_document=pdf_doc
                     )
                     
                     logger.info(f"Saved PDF to MongoDB 'websites' (nested): {file_id} in {website_url}")

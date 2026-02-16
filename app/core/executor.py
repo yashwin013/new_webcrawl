@@ -129,7 +129,7 @@ class ExecutorManager:
 
 
 # Global singleton instance
-executor_manager = ExecutorManager.get_instance(max_workers=4)
+executor_manager = ExecutorManager.get_instance(max_workers=8)  # Increased for heavy PDF processing
 
 
 # Application lifecycle hooks
