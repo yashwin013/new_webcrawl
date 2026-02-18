@@ -175,3 +175,217 @@ async def get_file_for_vector(createdby: str) -> List[Files]:
         raise HTTPException(status_code=404, detail="File not found")  # Return the HTTPException error directly
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"when get the files for vector Unexpected error: {str(e)}")
+
+
+# ============== Crawl-to-Vectorization Pipeline ==============
+
+async def vectorize_crawled_pdfs(crawl_session_id: str) -> dict:
+    """
+    Vectorize all PDFs from a completed crawl session using the Process_Docling pipeline.
+
+    Queries the 'websites' collection for PDFs with isVectorized="0",
+    then calls process_document_main() which handles:
+    - Docling conversion (GPU)
+    - HybridChunker (automatic chunking)
+    - Language filtering
+    - Image extraction & injection
+    - Qdrant insertion with duplicate detection
+
+    Args:
+        crawl_session_id: The crawl session ID to process PDFs for
+
+    Returns:
+        Dict with processing results summary
+    """
+    semaphore = _get_semaphore()
+    
+    results = {
+        "session_id": crawl_session_id,
+        "total_pdfs": 0,
+        "vectorized": 0,
+        "failed": 0,
+        "skipped": 0,
+        "duplicates": 0,
+    }
+
+    # Ensure database connection
+    if not db_manager.is_connected:
+        await db_manager.connect()
+
+    websites_collection = db_manager.get_collection("websites")
+
+    # Aggregation pipeline to extract unvectorized PDFs from nested structure
+    pipeline = [
+        {"$match": {"crawlSessionId": crawl_session_id}},
+        {"$unwind": "$visitedUrls"},
+        {"$unwind": "$visitedUrls.documents"},
+        {"$match": {
+            "visitedUrls.documents.documentType": "pdf",
+            "visitedUrls.documents.isVectorized": "0",
+            "visitedUrls.documents.isDeleted": {"$ne": True},
+        }},
+        {"$project": {
+            "_id": 1,
+            "websiteUrl": 1,
+            "crawlSessionId": 1,
+            "visitedUrl": "$visitedUrls.url",
+            "doc": "$visitedUrls.documents",
+        }},
+    ]
+
+    cursor = websites_collection.aggregate(pipeline)
+    pdf_docs = await cursor.to_list(length=None)
+    results["total_pdfs"] = len(pdf_docs)
+
+    if not pdf_docs:
+        logger.info(f"No unvectorized PDFs found for session {crawl_session_id}")
+        return results
+
+    logger.info(f"Found {len(pdf_docs)} unvectorized PDFs for session {crawl_session_id}")
+
+    # Process each PDF through the Process_Docling pipeline
+    async with semaphore:
+        _documentProcessor = await AsyncDocumentProcessor.from_config()
+
+        for pdf_info in pdf_docs:
+            doc = pdf_info["doc"]
+            file_id = doc.get("fileId", "")
+            file_name = doc.get("originalFile", "unknown.pdf")
+            file_path = doc.get("filePath", "")
+            website_url = pdf_info.get("websiteUrl", "")
+            visited_url = pdf_info.get("visitedUrl", "")
+
+            if not file_path or not os.path.exists(file_path):
+                # Try fallback path using UPLOAD_DIR + fileId
+                fallback_path = os.path.join(app_config.UPLOAD_DIR, file_id)
+                if os.path.exists(fallback_path):
+                    file_path = fallback_path
+                else:
+                    logger.error(f"PDF file not found: {file_path} (nor {fallback_path}). Skipping {file_id}.")
+                    await _update_pdf_vectorization_status(
+                        websites_collection, website_url, crawl_session_id,
+                        visited_url, file_id, status="-1"
+                    )
+                    results["failed"] += 1
+                    continue
+
+            logger.info(f"Processing PDF: {file_name} ({file_id})")
+
+            try:
+                process_result = await _documentProcessor.process_document_main(
+                    file_id, file_name, file_path
+                )
+
+                if process_result is None or (isinstance(process_result, dict) and process_result.get("status") == "failed"):
+                    logger.error(f"Processing failed for {file_id}")
+                    await _update_pdf_vectorization_status(
+                        websites_collection, website_url, crawl_session_id,
+                        visited_url, file_id, status="-1"
+                    )
+                    results["failed"] += 1
+                    continue
+
+                if isinstance(process_result, dict):
+                    status = process_result.get("status", "")
+
+                    if status == "duplicate":
+                        logger.info(f"File {file_id} already vectorized (duplicates)")
+                        await _update_pdf_vectorization_status(
+                            websites_collection, website_url, crawl_session_id,
+                            visited_url, file_id, status="1"
+                        )
+                        results["duplicates"] += 1
+                        continue
+
+                    if status == "partial_failure":
+                        logger.warning(f"Partial failure for {file_id}")
+                        await _update_pdf_vectorization_status(
+                            websites_collection, website_url, crawl_session_id,
+                            visited_url, file_id, status="4"
+                        )
+                        results["failed"] += 1
+                        continue
+
+                    if status == "inserted":
+                        logger.info(f"Successfully vectorized {file_id} ({process_result.get('count', 0)} chunks)")
+                        await _update_pdf_vectorization_status(
+                            websites_collection, website_url, crawl_session_id,
+                            visited_url, file_id, status="1"
+                        )
+                        results["vectorized"] += 1
+                        continue
+
+                # Fallback for non-dict return (older processor returns file_id string on success)
+                if process_result:
+                    await _update_pdf_vectorization_status(
+                        websites_collection, website_url, crawl_session_id,
+                        visited_url, file_id, status="1"
+                    )
+                    results["vectorized"] += 1
+                else:
+                    await _update_pdf_vectorization_status(
+                        websites_collection, website_url, crawl_session_id,
+                        visited_url, file_id, status="-1"
+                    )
+                    results["failed"] += 1
+
+            except Exception as e:
+                logger.error(f"Exception processing {file_id}: {e}", exc_info=True)
+                await _update_pdf_vectorization_status(
+                    websites_collection, website_url, crawl_session_id,
+                    visited_url, file_id, status="-1"
+                )
+                results["failed"] += 1
+
+    logger.info(
+        f"Vectorization complete for session {crawl_session_id}: "
+        f"{results['vectorized']} vectorized, {results['failed']} failed, "
+        f"{results['duplicates']} duplicates out of {results['total_pdfs']} total"
+    )
+    return results
+
+
+async def _update_pdf_vectorization_status(
+    websites_collection,
+    website_url: str,
+    crawl_session_id: str,
+    visited_url: str,
+    file_id: str,
+    status: str = "1",
+):
+    """
+    Update the isVectorized field for a specific PDF in the nested websites collection.
+
+    Uses MongoDB's arrayFilters to target the exact nested document.
+    """
+    try:
+        update_result = await websites_collection.update_one(
+            {
+                "websiteUrl": website_url,
+                "crawlSessionId": crawl_session_id,
+            },
+            {
+                "$set": {
+                    "visitedUrls.$[url].documents.$[doc].isVectorized": status,
+                    "visitedUrls.$[url].documents.$[doc].updatedAt": datetime.now(timezone.utc),
+                    "visitedUrls.$[url].documents.$[doc].status": (
+                        "vectorized" if status == "1"
+                        else "failed" if status == "-1"
+                        else "partial_failure" if status == "4"
+                        else "pending"
+                    ),
+                }
+            },
+            array_filters=[
+                {"url.url": visited_url},
+                {"doc.fileId": file_id},
+            ],
+        )
+
+        if update_result.modified_count > 0:
+            logger.debug(f"Updated isVectorized={status} for {file_id} in websites collection")
+        else:
+            logger.warning(f"No document matched for status update: {file_id} in {visited_url}")
+
+    except Exception as e:
+        logger.error(f"Failed to update vectorization status for {file_id}: {e}", exc_info=True)

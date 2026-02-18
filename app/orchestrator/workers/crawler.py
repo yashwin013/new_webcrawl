@@ -130,8 +130,15 @@ class CrawlerWorker(BaseWorker):
             # Set callback for streaming pages
             self.crawler_stage.on_page_crawled = self._on_page_crawled
             
+            # CRITICAL: Inject coordinator's session ID so all PDFs saved to MongoDB
+            # use the same session ID that vectorize_crawled_pdfs() will query with.
+            if task.crawl_session_id:
+                self.crawler_stage._crawl_session_id = task.crawl_session_id
+                logger.info(f"[{self.worker_id}] Using coordinator session ID: {task.crawl_session_id}")
+            
             # Run crawler (will stream pages to processing queue via callback)
             document = await self.crawler_stage.process(document)
+
             
             # Update task progress
             task.pages_discovered = len(document.pages)

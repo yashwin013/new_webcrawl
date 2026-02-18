@@ -118,8 +118,10 @@ class CrawlerStage(PipelineStage):
         base_domain = self._get_base_domain(start_url)
         document.start_time = time.time()
         
-        # Set crawl session ID for this crawl
-        self._crawl_session_id = str(uuid.uuid4())
+        # Set crawl session ID - use externally injected one if available (from coordinator)
+        # otherwise generate a new one for standalone use
+        if not getattr(self, '_crawl_session_id', None):
+            self._crawl_session_id = str(uuid.uuid4())
         logger.info(f"Starting crawl session: {self._crawl_session_id}")
         
         # Parse robots.txt
@@ -448,11 +450,46 @@ class CrawlerStage(PipelineStage):
             pdf_path = output_dir / f"{filename}.pdf"
             await page_obj.pdf(path=str(pdf_path))
             
-            # --- VECTOR PIPELINE DISABLED IN ORCHESTRATOR MODE ---
-            # Note: In orchestrator mode, PDFs are automatically queued for processing
-            # by the PDF processor workers. This legacy integration causes memory exhaustion
-            # and blocks crawlers. Keep this code disabled during orchestration.
-            # --- END VECTOR PIPELINE INTEGRATION ---
+            # Save PDF metadata to MongoDB so post-crawl vectorization can find it
+            try:
+                from app.services.document_store import DocumentStore
+                from app.schemas.document import DocumentStatus, PdfDocument
+                import uuid as _uuid
+                store = DocumentStore.from_config()
+                
+                crawl_session_id = getattr(self, '_crawl_session_id', str(_uuid.uuid4()))
+                parsed_page_url = urlparse(url)
+                website_url = f"{parsed_page_url.scheme}://{parsed_page_url.netloc}"
+                
+                pdf_doc = PdfDocument(
+                    file_id=filename,
+                    original_file=f"{filename}.pdf",
+                    source_url=url,
+                    file_path=str(pdf_path),
+                    document_type="pdf",
+                    mime_type="application/pdf",
+                    crawl_session_id=crawl_session_id,
+                    file_size=pdf_path.stat().st_size if pdf_path.exists() else 0,
+                    crawl_depth=depth,
+                    status=DocumentStatus.STORED,
+                    is_crawled="1",
+                    total_pages=0,
+                    pages_with_text=0,
+                    pages_needing_ocr=0,
+                )
+                
+                await asyncio.to_thread(
+                    store.add_page_to_website,
+                    website_url=website_url,
+                    crawl_session_id=crawl_session_id,
+                    visited_url=url,
+                    crawl_depth=depth,
+                    page_document=pdf_doc,
+                )
+                logger.debug(f"Saved HTML-printed PDF to MongoDB: {filename} for {url}")
+            except Exception as e:
+                logger.warning(f"Failed to save HTML-printed PDF to MongoDB: {e}")
+
             
             elapsed = (time.time() - start_time) * 1000
             

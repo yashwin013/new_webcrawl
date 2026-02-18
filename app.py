@@ -439,10 +439,18 @@ Examples:
                 print(f"{'='*70}\n")
                 
                 await orchestrator.startup()
+                
+                # Generate session ID here so we can use it for post-crawl vectorization
+                import uuid as _uuid
+                from datetime import datetime as _dt
+                crawl_session_id = f"session-{_dt.utcnow().strftime('%Y%m%d-%H%M%S')}-{_uuid.uuid4().hex[:8]}"
+                print(f"Crawl Session ID: {crawl_session_id}")
+                
                 await orchestrator.crawl_websites(
                     args.urls,
                     max_pages_per_site=args.max_pages,
-                    max_depth=args.max_depth
+                    max_depth=args.max_depth,
+                    crawl_session_id=crawl_session_id,
                 )
                 
                 # Results
@@ -463,6 +471,28 @@ Examples:
                         print(f"Success rate: {progress['tasks']['success_rate']:.1f}%")
                 
                 print(f"{'='*70}\n")
+                
+                # === Post-Crawl: Vectorize PDFs via Process_Docling pipeline ===
+                # Runs BEFORE shutdown() so DB connections are still alive
+                try:
+                    from app.docling.pipeline import vectorize_crawled_pdfs
+                    print(f"\n{'='*70}")
+                    print("POST-CRAWL PDF VECTORIZATION (Process_Docling)")
+                    print(f"Session: {crawl_session_id}")
+                    print(f"{'='*70}\n")
+                    vresults = await vectorize_crawled_pdfs(crawl_session_id)
+                    print(f"\n{'='*70}")
+                    print("VECTORIZATION SUMMARY")
+                    print(f"{'='*70}")
+                    print(f"  Total PDFs:      {vresults.get('total_pdfs', 0)}")
+                    print(f"  Vectorized:      {vresults.get('vectorized', 0)}")
+                    print(f"  Duplicates:      {vresults.get('duplicates', 0)}")
+                    print(f"  Failed:          {vresults.get('failed', 0)}")
+                    print(f"{'='*70}\n")
+                except Exception as e:
+                    print(f"\n⚠ Vectorization failed: {e}")
+                    import traceback; traceback.print_exc()
+                    print("Crawl data is saved. Retry vectorization manually if needed.")
                 
             finally:
                 await orchestrator.shutdown()

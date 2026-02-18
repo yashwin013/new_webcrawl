@@ -378,6 +378,9 @@ class MultiSiteOrchestrator:
             
             logger.info(f"  → Queued: {url}")
         
+        # Store session ID for post-crawl vectorization
+        self._crawl_session_id = crawl_session_id
+        
         logger.info("="*70)
         logger.info("All websites queued. Workers processing...")
         logger.info("="*70)
