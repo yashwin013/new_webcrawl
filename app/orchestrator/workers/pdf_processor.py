@@ -8,16 +8,16 @@ GPU-intensive worker - should have minimal concurrency (1-2 workers max).
 import aiofiles
 import asyncio
 import time
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 from app.config import get_logger, OCR_MIN_WORD_COUNT_SUFFICIENT
 from app.orchestrator.workers.base import BaseWorker
 from app.orchestrator.queues import QueueManager
 from app.orchestrator.models.task import PdfTask, StorageTask
-from app.orchestrator.workers.helpers.text_processor import chunk_page_text
 from app.docling.processor import AsyncDocumentProcessor
 from app.crawling.models.document import Page, PageContent, ContentSource
+from docling_core.transforms.chunker.base import BaseChunk
 
 logger = get_logger(__name__)
 
@@ -40,15 +40,9 @@ class PdfProcessorWorker(BaseWorker):
         self,
         worker_id: str,
         queue_manager: QueueManager,
-        min_chunk_words: int = 100,
-        max_chunk_words: int = 512,
-        overlap_words: int = 50,
         timeout_seconds: int = 120,
     ):
         super().__init__(worker_id, queue_manager)
-        self.min_chunk_words = min_chunk_words
-        self.max_chunk_words = max_chunk_words
-        self.overlap_words = overlap_words
         self.timeout_seconds = timeout_seconds
         
         # Docling processor (lazy initialization)
@@ -118,19 +112,13 @@ class PdfProcessorWorker(BaseWorker):
                 )
                 
                 # Optional: Save as markdown file
-                # Extract file_id from URL or use PDF filename
                 file_id = page.url_hash if hasattr(page, 'url_hash') else pdf_path.stem
                 markdown_path = await self._save_markdown(pdf_path, file_id)
                 if markdown_path:
                     logger.info(f"[{self.worker_id}] Saved markdown: {markdown_path}")
                 
-                # Chunk the text
-                chunks = chunk_page_text(
-                    page,
-                    min_words=self.min_chunk_words,
-                    max_words=self.max_chunk_words,
-                    overlap_words=self.overlap_words,
-                )
+                # Create chunks using Docling's HybridChunker
+                chunks = await self._create_chunks_from_docling()
                 
                 if chunks:
                     # Create storage task
@@ -143,6 +131,7 @@ class PdfProcessorWorker(BaseWorker):
                             "url": page.url,
                             "depth": page.depth,
                             "pdf_processed": True,
+                            "docling_chunked": True,
                             "processing_time_seconds": processing_time,
                         },
                         priority=task.priority,
@@ -151,7 +140,7 @@ class PdfProcessorWorker(BaseWorker):
                     await self.queue_manager.put_storage_task(storage_task)
                     
                     logger.info(
-                        f"[{self.worker_id}] Created {len(chunks)} chunks "
+                        f"[{self.worker_id}] Created {len(chunks)} HybridChunker chunks "
                         f"from PDF: {page.url}"
                     )
                 else:
@@ -211,13 +200,13 @@ class PdfProcessorWorker(BaseWorker):
     
     async def _extract_pdf_text(self, pdf_path: Path) -> str:
         """
-        Extract text from PDF using Docling.
+        Extract text from PDF using Docling and initialize for chunking.
         
         Args:
             pdf_path: Path to PDF file
             
         Returns:
-            Extracted text
+            Extracted text (markdown preview)
         """
         # Lazy initialization of Docling processor with GPU
         if self._docling_processor is None:
@@ -226,44 +215,147 @@ class PdfProcessorWorker(BaseWorker):
                 executor=None,  # Will use executor from manager
                 skip_ocr=True,  # CRITICAL: Disable OCR in Phase 1 to prevent memory exhaustion
             )
+            # Initialize chunker components
+            await self._docling_processor.initialize_async()
         
-        # Use async conversion method
+        # Convert document (this sets self._docling_processor.doc)
         result = await self._docling_processor.convert_document_async(
             str(pdf_path)
         )
         
-        # Extract text from the DoclingDocument
+        # Extract text from the DoclingDocument for preview/validation
         if result and hasattr(result, 'export_to_markdown'):
             return result.export_to_markdown()
         
         return ""
     
+    async def _create_chunks_from_docling(self) -> List[Dict[str, Any]]:
+        """
+        Create chunks using Docling's HybridChunker and convert to storage format.
+        
+        Returns:
+            List of chunk dictionaries ready for storage
+        """
+        if not self._docling_processor or not self._docling_processor.doc:
+            logger.error(f"[{self.worker_id}] Cannot create chunks - document not converted")
+            return []
+        
+        try:
+            # Create chunks using HybridChunker
+            base_chunks = await self._docling_processor.create_chunks_async()
+            
+            if not base_chunks:
+                logger.warning(f"[{self.worker_id}] HybridChunker returned no chunks")
+                return []
+            
+            # Convert BaseChunk objects to storage-compatible dictionaries
+            storage_chunks = []
+            for idx, chunk in enumerate(base_chunks):
+                # Contextualize chunk to get full text
+                chunk_text = await self._contextualize_chunk(chunk)
+                
+                # Extract metadata from chunk
+                chunk_dict = {
+                    "text": chunk_text,
+                    "chunk_index": idx,
+                    "word_count": len(chunk_text.split()),
+                    "metadata": {
+                        "page_number": self._extract_page_number(chunk),
+                        "heading_text": self._extract_heading(chunk),
+                        "doc_items_refs": self._extract_doc_items_refs(chunk),
+                        "has_image": "![" in chunk_text and "](" in chunk_text,
+                        "source": "docling_hybrid_chunker",
+                    }
+                }
+                storage_chunks.append(chunk_dict)
+            
+            logger.debug(
+                f"[{self.worker_id}] Converted {len(storage_chunks)} BaseChunks to storage format"
+            )
+            return storage_chunks
+            
+        except Exception as e:
+            logger.error(
+                f"[{self.worker_id}] Failed to create chunks from Docling: {e}",
+                exc_info=True
+            )
+            return []
+    
+    async def _contextualize_chunk(self, chunk: BaseChunk) -> str:
+        """Contextualize a chunk to get its full text representation."""
+        try:
+            if not self._docling_processor or not self._docling_processor.chunker:
+                # Fallback to chunk.text if chunker not available
+                return chunk.text if hasattr(chunk, 'text') else str(chunk)
+            
+            # Run contextualization in executor
+            loop = asyncio.get_event_loop()
+            ctx_text = await loop.run_in_executor(
+                self._docling_processor.executor,
+                lambda: self._docling_processor.chunker.contextualize(chunk=chunk)
+            )
+            return ctx_text
+        except Exception as e:
+            logger.warning(f"[{self.worker_id}] Contextualization failed: {e}")
+            # Fallback to chunk.text
+            return chunk.text if hasattr(chunk, 'text') else str(chunk)
+    
+    def _extract_page_number(self, chunk: BaseChunk) -> int:
+        """Extract page number from chunk metadata."""
+        try:
+            from docling_core.transforms.chunker.hierarchical_chunker import DocChunk
+            doc_chunk = DocChunk.model_validate(chunk)
+            if doc_chunk.meta and doc_chunk.meta.doc_items:
+                for item in doc_chunk.meta.doc_items:
+                    if hasattr(item, 'prov') and item.prov:
+                        for prov in item.prov:
+                            if hasattr(prov, 'page_no'):
+                                return prov.page_no
+        except Exception:
+            pass
+        return 1
+    
+    def _extract_heading(self, chunk: BaseChunk) -> Optional[str]:
+        """Extract heading from chunk metadata."""
+        try:
+            from docling_core.transforms.chunker.hierarchical_chunker import DocChunk
+            doc_chunk = DocChunk.model_validate(chunk)
+            if doc_chunk.meta and doc_chunk.meta.headings:
+                return " > ".join(doc_chunk.meta.headings)
+        except Exception:
+            pass
+        return None
+    
+    def _extract_doc_items_refs(self, chunk: BaseChunk) -> List[str]:
+        """Extract document item references from chunk."""
+        try:
+            from docling_core.transforms.chunker.hierarchical_chunker import DocChunk
+            doc_chunk = DocChunk.model_validate(chunk)
+            if doc_chunk.meta and doc_chunk.meta.doc_items:
+                return [str(item.self_ref) for item in doc_chunk.meta.doc_items]
+        except Exception:
+            pass
+        return []
+    
     async def _save_markdown(self, pdf_path: Path, file_id: str) -> Optional[Path]:
         """
-        Extract and save PDF as markdown file.
+        Save already-converted PDF as markdown file.
         
         Args:
-            pdf_path: Path to PDF file
+            pdf_path: Path to PDF file (for reference)
             file_id: Unique identifier for the file
             
         Returns:
             Path to saved markdown file, or None if failed
         """
         try:
-            # Lazy initialization of Docling processor with GPU
-            if self._docling_processor is None:
-                self._docling_processor = AsyncDocumentProcessor(
-                    use_gpu=True,
-                    executor=None,
-                    skip_ocr=True,
-                )
-            
-            # Convert document
-            result = await self._docling_processor.convert_document_async(
-                str(pdf_path)
-            )
+            # Use already converted document
+            if not self._docling_processor or not self._docling_processor.doc:
+                logger.warning(f"[{self.worker_id}] Cannot save markdown - document not converted")
+                return None
             
             # Export to markdown
+            result = self._docling_processor.doc
             if result and hasattr(result, 'export_to_markdown'):
                 markdown_content = result.export_to_markdown()
                 
@@ -273,11 +365,9 @@ class PdfProcessorWorker(BaseWorker):
                 
                 # Save markdown file
                 markdown_path = markdown_dir / f"{file_id}.md"
-                import aiofiles
                 async with aiofiles.open(markdown_path, 'w', encoding='utf-8') as f:
                     await f.write(markdown_content)
                 
-                logger.info(f"[{self.worker_id}] Saved markdown: {markdown_path}")
                 return markdown_path
             
             return None

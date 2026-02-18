@@ -5,6 +5,16 @@ Processes pages that were marked as needing OCR during orchestrator run.
 Uses batch processing (10 pages at a time) to avoid GPU memory issues.
 Automatically clears GPU cache between batches.
 
+⚠️ DEPRECATED: This script uses old sentence-based chunking.
+⚠️ TODO: Refactor to use Docling's HybridChunker like pdf_processor.py
+
+RECOMMENDED APPROACH:
+    Process OCR backlog PDFs through the normal orchestrator with skip_ocr=False
+    OR refactor this script to use:
+        - AsyncDocumentProcessor.convert_document_async()
+        - AsyncDocumentProcessor.create_chunks_async()
+    See app/orchestrator/workers/pdf_processor.py for reference implementation.
+
 RECOMMENDED USAGE (Sets optimal GPU memory config):
     Windows: process_ocr_backlog.bat
     Linux/Mac: ./process_ocr_backlog.sh
@@ -36,7 +46,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.config import get_logger
 from app.crawling.models.document import Page, OCRAction, PageContent, ContentSource
 from app.orchestrator.workers.helpers.ocr_processor import process_page_ocr
-from app.orchestrator.workers.helpers.text_processor import chunk_page_text
+# REMOVED: chunk_page_text - needs refactoring to use HybridChunker
+# from app.orchestrator.workers.helpers.text_processor import chunk_page_text
 from app.services.document_store import DocumentStore
 
 logger = get_logger(__name__)
@@ -233,13 +244,13 @@ async def process_single_page(
         # Update page content with OCR text
         page.content = PageContent.from_text(ocr_text, ContentSource.OCR)
         
-        # Chunk the OCR'd text with lower threshold for OCR content
-        chunks = chunk_page_text(
-            page,
-            min_words=20,  # Lower threshold for OCR content (was 100)
-            max_words=512,
-            overlap_words=25,  # Smaller overlap for short content
+        # TODO: Refactor to use HybridChunker - chunk_page_text has been removed
+        # This script needs to be updated to use AsyncDocumentProcessor.create_chunks_async()
+        logger.error(
+            f"OCR backlog script needs refactoring to use HybridChunker. "
+            f"Cannot process {url} - skipping"
         )
+        chunks = []  # Stub: chunk_page_text was removed
         
         if not chunks:
             logger.warning(f"No chunks created (text too short: {word_count} words): {url}")

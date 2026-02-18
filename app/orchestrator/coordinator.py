@@ -216,13 +216,11 @@ class MultiSiteOrchestrator:
         
         logger.info(f"  ✓ {len(self.crawler_workers)} crawler workers")
         
-        # Spawn processor workers
-        enable_ocr = self.config.workers.ocr_workers > 0
+        # Spawn processor workers (now just routers to PDF processor)
         for i in range(self.config.workers.processor_workers):
             worker = ProcessorWorker(
                 f"processor-{i+1}",
                 self.queue_manager,
-                enable_ocr=enable_ocr,  # Disable OCR routing if no OCR workers
             )
             await worker.startup()
             self.processor_workers.append(worker)
@@ -451,7 +449,7 @@ class MultiSiteOrchestrator:
             await self._log_progress()
             
             # Wait before next check (check shutdown every second)
-            for _ in range(self.config.monitoring_interval_seconds):
+            for _ in range(int(self.config.monitoring_interval_seconds)):
                 if self._shutdown_event.is_set():
                     logger.info("Shutdown signal received during monitoring")
                     return
@@ -588,8 +586,7 @@ class MultiSiteOrchestrator:
             new_worker = CrawlerWorker(worker_id, self.queue_manager)
             worker_list = self.crawler_workers
         elif worker_type == "processor":
-            enable_ocr = self.config.workers.ocr_workers > 0
-            new_worker = ProcessorWorker(worker_id, self.queue_manager, enable_ocr=enable_ocr)
+            new_worker = ProcessorWorker(worker_id, self.queue_manager)
             worker_list = self.processor_workers
         elif worker_type == "pdf":
             new_worker = PdfProcessorWorker(worker_id, self.queue_manager)

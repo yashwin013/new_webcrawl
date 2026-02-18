@@ -134,11 +134,11 @@ class AsyncDocumentProcessor:
             )
         )
         
-        # # Initialize serializer provider
-        # self.serializer_provider = ImgPlaceholderSerializerProvider(
-        #     output_dir=self.output_dir,
-        #     executor=self.executor
-        # )
+        # Initialize serializer provider if not provided
+        if self.serializer_provider is None:
+            self.serializer_provider = await ImgPlaceholderSerializerProvider.from_config(
+                _executor=self.executor
+            )
         
         return self
     

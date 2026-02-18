@@ -3,6 +3,16 @@ OCR Worker
 
 Performs OCR on pages using GPU (Surya models).
 GPU-intensive worker - should have minimal concurrency (1-2 workers max).
+
+⚠️ DEPRECATED: This worker uses old sentence-based chunking.
+⚠️ TODO: Refactor to use Docling's HybridChunker like pdf_processor.py
+⚠️ Currently disabled in orchestrator (ocr_workers=0)
+
+If re-enabling OCR worker:
+1. Remove chunk_page_text() calls
+2. Convert OCR'd PDF to DoclingDocument
+3. Use AsyncDocumentProcessor.create_chunks_async()
+4. Follow pattern in app/orchestrator/workers/pdf_processor.py
 """
 
 import asyncio
@@ -14,7 +24,8 @@ from app.orchestrator.workers.base import BaseWorker
 from app.orchestrator.queues import QueueManager
 from app.orchestrator.models.task import OcrTask, StorageTask
 from app.orchestrator.workers.helpers.ocr_processor import process_page_ocr
-from app.orchestrator.workers.helpers.text_processor import chunk_page_text
+# REMOVED: chunk_page_text - needs refactoring to use HybridChunker
+# from app.orchestrator.workers.helpers.text_processor import chunk_page_text
 from app.crawling.models.document import PageContent, ContentSource
 
 logger = get_logger(__name__)
@@ -109,13 +120,13 @@ class OcrWorker(BaseWorker):
             else:
                 logger.warning(f"[{self.worker_id}] No OCR text extracted from {page.url}")
             
-            # Chunk the text (CPU operation, but we do it here to keep page context)
-            chunks = chunk_page_text(
-                page,
-                min_words=self.min_chunk_words,
-                max_words=self.max_chunk_words,
-                overlap_words=self.overlap_words,
+            # TODO: Refactor to use HybridChunker - chunk_page_text has been removed
+            # This worker is currently disabled (ocr_workers=0 in config)
+            logger.error(
+                f"[{self.worker_id}] OCR worker needs refactoring to use HybridChunker. "
+                f"Cannot process {page.url} - marking as failed"
             )
+            chunks = []  # Stub: chunk_page_text was removed
             
             if chunks:
                 # Create storage task
@@ -158,13 +169,12 @@ class OcrWorker(BaseWorker):
                 f"chunking with existing content"
             )
             
-            # Timeout - chunk with whatever content we have (no OCR text)
-            chunks = chunk_page_text(
-                page,
-                min_words=self.min_chunk_words,
-                max_words=self.max_chunk_words,
-                overlap_words=self.overlap_words,
+            # TODO: Refactor to use HybridChunker - chunk_page_text has been removed
+            logger.error(
+                f"[{self.worker_id}] OCR worker needs refactoring to use HybridChunker. "
+                f"Cannot process {page.url} - marking as failed"
             )
+            chunks = []  # Stub: chunk_page_text was removed
             
             if chunks:
                 storage_task = StorageTask(

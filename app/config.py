@@ -85,7 +85,7 @@ LARGE_PDF_STORAGE_DIR = os.getenv("LARGE_PDF_STORAGE_DIR", "data/pdfs/large_file
 # ============== OCR Decision Thresholds (Conservative - Minimize OCR Usage) ==============
 # Only use OCR when absolutely necessary to save processing time
 # Lower word count threshold = less aggressive, fewer PDFs sent to OCR
-OCR_MIN_WORD_COUNT_SUFFICIENT = int(os.getenv("OCR_MIN_WORD_COUNT_SUFFICIENT", "20"))  # Lowered from 50 to 20 - only truly empty PDFs go to OCR
+OCR_MIN_WORD_COUNT_SUFFICIENT = int(os.getenv("OCR_MIN_WORD_COUNT_SUFFICIENT", "50"))  # PDFs with ≤50 words go to OCR backlog
 OCR_SCANNED_PDF_MAX_WORDS = int(os.getenv("OCR_SCANNED_PDF_MAX_WORDS", "10"))  # Lowered from 20 to 10
 # Image thresholds - only OCR large, text-bearing images
 OCR_MIN_TEXT_BEARING_IMAGES = int(os.getenv("OCR_MIN_TEXT_BEARING_IMAGES", "5"))  # Changed from 3 to 5
